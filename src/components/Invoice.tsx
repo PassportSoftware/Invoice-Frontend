@@ -3,10 +3,11 @@ import { useSearchParams, useNavigate } from 'react-router-dom';
 import { useForm } from 'react-hook-form';
 import { yupResolver } from '@hookform/resolvers/yup';
 import * as yup from 'yup';
-import { useGetInvoiceQuery, useProcessPaymentMutation } from '../store/api';
+import { useGetInvoiceQuery, useSchedulePaymentMutation } from '../store/api';
+import type { InvoiceModel } from '../store/api';
 
 type PaymentOption = 'full' | 'partial' | 'dueDate';
-type PaymentMethod = 'creditCard' | 'ach' | 'check';
+type PaymentMethod = 'Credit Card' | 'ACH' | 'Check';
 
 interface PaymentFormData {
   paymentOption: PaymentOption;
@@ -22,12 +23,11 @@ const schema = yup.object().shape({
     then: (schema) => schema.required('Payment amount is required').positive('Amount must be positive'),
     otherwise: (schema) => schema.optional(),
   }),
-  paymentMethod: yup.string().required('Payment method is required').oneOf(['creditCard', 'ach', 'check']),
+  paymentMethod: yup.string().required('Payment method is required').oneOf(['Credit Card', 'ACH', 'Check']),
   additionalMessage: yup.string().max(100, 'Message cannot exceed 100 characters'),
 });
 
-// Credit card processing fee percentage
-const CREDIT_CARD_FEE_PERCENTAGE = 2.9;
+// No longer need a constant for credit card fee as it comes from the API
 
 const Invoice: React.FC = () => {
   const navigate = useNavigate();
@@ -35,20 +35,53 @@ const Invoice: React.FC = () => {
   const invoiceId = searchParams.get('invoiceId') || '';
   const pin = searchParams.get('pin') || '';
   
-  const { data: invoice, isLoading, error } = useGetInvoiceQuery({ invoiceId, pin });
-  const [processPayment, { isLoading: isProcessing }] = useProcessPaymentMutation();
+  // First, get the invoice details
+  const { data: invoice, isLoading, error: fetchError } = useGetInvoiceQuery({ invoiceId, pin }) as { data: InvoiceModel | undefined, isLoading: boolean, error: any };
+  const [schedulePayment, { isLoading: isProcessing }] = useSchedulePaymentMutation();
   
   const [showPartialPayment, setShowPartialPayment] = useState(false);
+  
+  // If we have invoice data, the PIN was already verified by the API
+  // No need for local verification since the API returns 200 only if PIN is valid
+  const isVerified = !!invoice;
+  
+  // Determine if the invoice already has payment data
+  const hasExistingPayment = invoice && invoice.payment_method && invoice.payment_date;
   
   const {
     register,
     handleSubmit,
     watch,
+    setValue,
     formState: { errors }
   } = useForm<PaymentFormData>({
     resolver: yupResolver(schema) as any, // Type assertion to fix resolver type issue
-    // Remove default values to have them unselected by default
   });
+  
+  // Set form values when invoice data is loaded
+  React.useEffect(() => {
+    if (hasExistingPayment && invoice) {
+      // Determine the payment option based on the payment date
+      const paymentDate = new Date(invoice.payment_date!);
+      const dueDate = new Date(invoice.payment_due_date);
+      
+      // If payment date is the same as due date or in the future, set to "dueDate" option
+      // Otherwise, set to "full" for immediate payment
+      if (paymentDate >= dueDate || 
+          invoice.status.toLowerCase().includes('scheduled')) {
+        setValue('paymentOption', 'dueDate');
+      } else {
+        setValue('paymentOption', 'full');
+      }
+      
+      // Set the payment method if it exists
+      if (invoice.payment_method === 'Credit Card' || 
+          invoice.payment_method === 'ACH' || 
+          invoice.payment_method === 'Check') {
+        setValue('paymentMethod', invoice.payment_method as PaymentMethod);
+      }
+    }
+  }, [invoice, hasExistingPayment, setValue]);
   
   // Watch payment option to conditionally show partial payment field
   const paymentOption = watch('paymentOption');
@@ -65,13 +98,31 @@ const Invoice: React.FC = () => {
   
   const onSubmit = async (data: any) => { // Use any to fix type compatibility issue
     try {
-      const result = await processPayment({
+      // Convert payment method to API format
+      const paymentMethod = data.paymentMethod as PaymentMethod;
+      
+      // Get today's date in YYYY-MM-DD format for payment date
+      const today = new Date();
+      const paymentDate = today.toISOString().split('T')[0];
+      
+      // Schedule the payment using the API
+      const result = await schedulePayment({
         invoiceId,
-        ...data
+        pin,
+        paymentMethod,
+        paymentDate
       }).unwrap();
       
       // Navigate to payment confirmation page
-      navigate('/confirmation', { state: { paymentResult: result } });
+      // Pass both the payment result and the PIN to maintain state when returning
+      navigate('/confirmation', { 
+        state: { 
+          paymentResult: result,
+          pin: pin, // Include the PIN so we can navigate back to the invoice
+          // Use the hash_code if invoice is available, otherwise use the original invoiceId
+          invoiceId: invoice?.hash_code || invoiceId
+        } 
+      });
     } catch (error) {
       console.error('Failed to process payment:', error);
       // Handle error
@@ -91,12 +142,12 @@ const Invoice: React.FC = () => {
     );
   }
   
-  if (error || !invoice) {
+  if (fetchError || !invoice) {
     return (
       <div className="container mt-5">
         <div className="alert alert-danger" role="alert">
           <h4 className="alert-heading">Error!</h4>
-          <p>Unable to load invoice details. Please check your PIN and try again.</p>
+          <p>Unable to load invoice details. The invoice ID may be invalid.</p>
           <hr />
           <button
             className="btn btn-outline-danger"
@@ -104,6 +155,39 @@ const Invoice: React.FC = () => {
           >
             Go Back
           </button>
+        </div>
+      </div>
+    );
+  }
+  
+  // If we get here with no invoice data, it means the API call failed
+  // This could be due to network issues or invalid credentials
+  if (!isVerified && !isLoading) {
+    return (
+      <div className="container mt-5">
+        <div className="alert alert-danger" role="alert">
+          <h4 className="alert-heading">Invoice Access Failed</h4>
+          <p>Unable to access invoice data. This could be due to an invalid PIN or invoice ID.</p>
+          <hr />
+          <button
+            className="btn btn-outline-danger"
+            onClick={() => navigate('/')}
+          >
+            Go Back
+          </button>
+        </div>
+      </div>
+    );
+  }
+  
+  if (!isVerified) {
+    return (
+      <div className="container mt-5">
+        <div className="text-center">
+          <div className="spinner-border" role="status">
+            <span className="visually-hidden">Verifying...</span>
+          </div>
+          <p className="mt-2">Verifying PIN...</p>
         </div>
       </div>
     );
@@ -117,37 +201,53 @@ const Invoice: React.FC = () => {
         </div>
         
         <div className="card-body">
-          <h5 className="text-start">Invoice Details</h5>
-          <div className="row mb-3">
-            <div className="col-md-6 text-start">
-              <p className="mb-1"><strong>Customer:</strong> {invoice.customer}</p>
-              <p className="mb-1"><strong>Invoice #:</strong> {invoice.invoiceNumber}</p>
-              <p className="mb-1"><strong>Issue Date:</strong> {invoice.issueDate}</p>
-              <p className="mb-1"><strong>Due Date:</strong> {invoice.dueDate}</p>
+          {hasExistingPayment && (
+            <div className="alert alert-info mb-3">
+              <strong>Payment Scheduled:</strong> This invoice has been scheduled for payment on {new Date(invoice.payment_date!).toLocaleDateString()} using {invoice.payment_method}.
             </div>
+          )}
+          
+          <div className="row">
+            {/* Invoice Details on the left */}
             <div className="col-md-6">
-              <div className="card">
+              <h5 className="text-start">Invoice Details</h5>
+              <div className="text-start">
+                <p><strong>Customer Number:</strong> {invoice.customer_number}</p>
+                <p><strong>Invoice Number:</strong> {invoice.invoice_number}</p>
+                <p><strong>Company Number:</strong> {invoice.company_number}</p>
+                <p><strong>Due Date:</strong> {new Date(invoice.payment_due_date).toLocaleDateString()}</p>
+                <p><strong>Status:</strong> {invoice.status}</p>
+                {invoice.payment_date && (
+                  <p><strong>Payment Date:</strong> {new Date(invoice.payment_date).toLocaleDateString()}</p>
+                )}
+              </div>
+            </div>
+            
+            {/* Total Due card on the right */}
+            <div className="col-md-6">
+              <div className="card h-100">
+                <div className="card-header bg-light">
+                  <h5 className="mb-0">Payment Summary</h5>
+                </div>
                 <div className="card-body">
                   <div className="d-flex justify-content-between">
-                    <p className="mb-2"><strong>Original Amount:</strong></p>
-                    <p className="mb-2">${invoice.originalAmount.toFixed(2)}</p>
+                    <p className="mb-2"><strong>Invoice Amount:</strong></p>
+                    <p className="mb-2">${parseFloat(invoice.invoice_amount).toFixed(2)}</p>
                   </div>
-                  <div className="d-flex justify-content-between">
-                    <p className="mb-2"><strong>Credit Memo ({invoice.creditMemo.id}):</strong></p>
-                    <p className="mb-2 text-success">-${invoice.creditMemo.amount.toFixed(2)}</p>
-                  </div>
-                  {selectedPaymentMethod === 'creditCard' && (
+                  {selectedPaymentMethod === 'Credit Card' && (
                     <div className="d-flex justify-content-between">
-                      <p className="mb-2"><strong>Processing Fee ({CREDIT_CARD_FEE_PERCENTAGE}%):</strong></p>
-                      <p className="mb-2 text-danger">+${(invoice.outstandingBalance * CREDIT_CARD_FEE_PERCENTAGE / 100).toFixed(2)}</p>
+                      <p className="mb-2"><strong>Credit Card Service Fee:</strong></p>
+                      <p className="mb-2 text-danger">+${parseFloat(invoice.cc_service_fee).toFixed(2)}</p>
                     </div>
                   )}
-                  <hr className="my-2" />
+                  <hr />
                   <div className="d-flex justify-content-between">
-                    <p className="mb-0"><strong>Total Due:</strong></p>
-                    <p className="mb-0 fw-bold">${selectedPaymentMethod === 'creditCard' 
-                      ? (invoice.outstandingBalance + (invoice.outstandingBalance * CREDIT_CARD_FEE_PERCENTAGE / 100)).toFixed(2)
-                      : invoice.outstandingBalance.toFixed(2)}</p>
+                    <h5 className="mb-0"><strong>Total Due:</strong></h5>
+                    <h5 className="mb-0">
+                      ${selectedPaymentMethod === 'Credit Card'
+                        ? (parseFloat(invoice.invoice_amount) + parseFloat(invoice.cc_service_fee)).toFixed(2)
+                        : parseFloat(invoice.invoice_amount).toFixed(2)}
+                    </h5>
                   </div>
                 </div>
               </div>
@@ -168,7 +268,7 @@ const Invoice: React.FC = () => {
                   // Remove checked attribute to fix radio button behavior
                 />
                 <label className="form-check-label text-start" htmlFor="payFull">
-                  Pay the invoice now in full (${invoice.outstandingBalance.toFixed(2)})
+                  Pay the invoice now in full (${parseFloat(invoice.invoice_amount).toFixed(2)})
                 </label>
               </div>
               
@@ -208,7 +308,7 @@ const Invoice: React.FC = () => {
                   <div className="mb-2">
                     <p className="text-muted text-start">
                       Remaining balance after this payment: 
-                      ${(invoice.outstandingBalance - (watch('paymentAmount') || 0)).toFixed(2)}
+                      ${(parseFloat(invoice.invoice_amount) - (watch('paymentAmount') || 0)).toFixed(2)}
                     </p>
                   </div>
                 </div>
@@ -221,11 +321,9 @@ const Invoice: React.FC = () => {
                   value="dueDate"
                   className="form-check-input"
                   {...register('paymentOption')}
-                  // onChange handled by useEffect
-                  // Remove checked attribute to fix radio button behavior
                 />
                 <label className="form-check-label text-start" htmlFor="payDueDate">
-                  Pay the invoice in full on its due date ({invoice.dueDate})
+                  Pay on due date ({new Date(invoice.payment_due_date).toLocaleDateString()})
                 </label>
               </div>
             </div>
@@ -238,16 +336,19 @@ const Invoice: React.FC = () => {
                     <input
                       type="radio"
                       id="payCredit"
-                      value="creditCard"
+                      value="Credit Card"
                       className="form-check-input"
                       {...register('paymentMethod')}
-                      // Remove checked attribute to fix radio button behavior
+                      disabled={!invoice.customer_cc_token}
                     />
                     <label className="form-check-label text-start" htmlFor="payCredit">
                       Pay using my credit card on file
                     </label>
-                    {selectedPaymentMethod === 'creditCard' && (
-                      <p className="text-warning ms-4 text-start">A {CREDIT_CARD_FEE_PERCENTAGE}% surcharge will be added to your payment amount.</p>
+                    {selectedPaymentMethod === 'Credit Card' && (
+                      <p className="text-warning ms-4 text-start">A service fee of ${parseFloat(invoice.cc_service_fee).toFixed(2)} will be added to your payment amount.</p>
+                    )}
+                    {!invoice.customer_cc_token && (
+                      <p className="text-muted ms-4 text-start">You don't have a credit card on file.</p>
                     )}
                   </div>
                   
@@ -255,16 +356,19 @@ const Invoice: React.FC = () => {
                     <input
                       type="radio"
                       id="payACH"
-                      value="ach"
+                      value="ACH"
                       className="form-check-input"
                       {...register('paymentMethod')}
-                      // Remove checked attribute to fix radio button behavior
+                      disabled={!invoice.customer_ach_enabled}
                     />
                     <label className="form-check-label text-start" htmlFor="payACH">
                       Pay using my ACH on file
                     </label>
-                    {selectedPaymentMethod === 'ach' && (
+                    {selectedPaymentMethod === 'ACH' && (
                       <p className="text-muted ms-4 text-start">No additional fees.</p>
+                    )}
+                    {!invoice.customer_ach_enabled && (
+                      <p className="text-muted ms-4 text-start">You don't have ACH set up.</p>
                     )}
                   </div>
                   
@@ -272,15 +376,14 @@ const Invoice: React.FC = () => {
                     <input
                       type="radio"
                       id="payCheck"
-                      value="check"
+                      value="Check"
                       className="form-check-input"
                       {...register('paymentMethod')}
-                      // Remove checked attribute to fix radio button behavior
                     />
                     <label className="form-check-label text-start" htmlFor="payCheck">
                       I prefer to send a check
                     </label>
-                    {selectedPaymentMethod === 'check' && (
+                    {selectedPaymentMethod === 'Check' && (
                       <p className="text-muted ms-4 text-start">This will be recorded for cash forecasting purposes.</p>
                     )}
                   </div>
@@ -316,7 +419,7 @@ const Invoice: React.FC = () => {
                   className="btn btn-primary"
                   disabled={isProcessing}
                 >
-                  {isProcessing ? 'Processing...' : 'Submit Payment'}
+                  {isProcessing ? 'Processing...' : hasExistingPayment ? 'Update Payment Details' : 'Submit Payment'}
                 </button>
               </div>
             )}

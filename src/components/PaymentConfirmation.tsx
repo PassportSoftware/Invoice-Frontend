@@ -78,7 +78,19 @@ const PaymentConfirmation: React.FC = () => {
           <div className="d-flex justify-content-between mt-4">
             <button
               className="btn btn-outline-secondary"
-              onClick={() => navigate('/invoice')}
+              onClick={() => {
+                // Use the hash_code from state if available, otherwise fall back to the invoice ID
+                const invoiceId = location.state?.invoiceId || '';
+                // We need to preserve the PIN from the state
+                const pin = location.state?.pin;
+                
+                if (invoiceId && pin) {
+                  navigate(`/invoice?invoiceId=${invoiceId}&pin=${pin}`);
+                } else {
+                  // Fallback to the home page if we don't have the necessary data
+                  navigate('/');
+                }
+              }}
             >
               Back to Invoice
             </button>

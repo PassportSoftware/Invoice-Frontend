@@ -22,7 +22,7 @@ export interface PaymentResponse {
   processingFee: number;
   totalAmount: number;
   transactionDate: string;
-  transactionId: string;
+  transactionId: string | null;
   success: boolean;
 }
 

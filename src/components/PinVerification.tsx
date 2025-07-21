@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { useForm } from 'react-hook-form';
 import { yupResolver } from '@hookform/resolvers/yup';
 import * as yup from 'yup';
@@ -16,7 +16,9 @@ type FormData = yup.InferType<typeof schema>;
 const PinVerification: React.FC = () => {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
-  const invoiceId = searchParams.get('invoiceId');
+  const invoiceId = searchParams.get('invoiceId') || '';
+  const [verifying, setVerifying] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   
   const {
     register,
@@ -26,10 +28,35 @@ const PinVerification: React.FC = () => {
     resolver: yupResolver(schema)
   });
 
-  const onSubmit = (data: FormData) => {
-    // In a real app, we would validate the PIN against the API
-    // For demo purposes, we'll just navigate to the invoice page
-    navigate(`/invoice?invoiceId=${invoiceId}&pin=${data.pin}`);
+  const onSubmit = async (data: FormData) => {
+    setVerifying(true);
+    setError(null);
+    
+    try {
+      // Get the API base URL from environment variables
+      const baseUrl = import.meta.env.VITE_API_BASE_URL || 'http://localhost:3000/';
+      const normalizedBaseUrl = baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`;
+      
+      // First, get the invoice to verify it exists with the PIN
+      const response = await fetch(`${normalizedBaseUrl}api/invoices/${invoiceId}?pin=${data.pin}`);
+      
+      if (!response.ok) {
+        // Parse the error response
+        const errorData = await response.json().catch(() => ({}));
+        setError(errorData.message || 'Invoice not found or PIN is incorrect. Please try again.');
+        setVerifying(false);
+        return;
+      }
+      
+      // We don't need to use the invoice data here, just check if it exists
+      
+      // Navigate to the invoice page with the PIN
+      // The actual PIN verification will happen in the Invoice component
+      navigate(`/invoice?invoiceId=${invoiceId}&pin=${data.pin}`);
+    } catch (err) {
+      setError('An error occurred. Please try again.');
+      setVerifying(false);
+    }
   };
 
   return (
@@ -55,6 +82,9 @@ const PinVerification: React.FC = () => {
                   {errors.pin && (
                     <div className="invalid-feedback">{errors.pin.message}</div>
                   )}
+                  {error && (
+                    <div className="alert alert-danger mt-3">{error}</div>
+                  )}
                   <div className="form-text">
                     A 6-digit PIN was sent to your email along with the invoice payment link.
                   </div>
@@ -63,9 +93,9 @@ const PinVerification: React.FC = () => {
                   <button 
                     type="submit" 
                     className="btn btn-primary mx-auto" 
-                    disabled={isSubmitting}
+                    disabled={isSubmitting || verifying}
                   >
-                    {isSubmitting ? 'Verifying...' : 'Verify PIN'}
+                    {isSubmitting || verifying ? 'Verifying...' : 'Verify PIN'}
                   </button>
                 </div>
               </form>

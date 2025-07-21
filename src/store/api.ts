@@ -1,109 +1,122 @@
 import { createApi, fetchBaseQuery } from '@reduxjs/toolkit/query/react';
-import type { Invoice, PaymentResponse } from '../mocks/invoiceData';
-import { mockInvoices } from '../mocks/invoiceData';
+import type { PaymentResponse } from '../mocks/invoiceData';
 
-// In a real app, this would be an environment variable
-const BASE_URL = '/api';
+// Use the VITE_API_BASE_URL from .env file
+const BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:3000/';
 
-// For demo purposes, we'll simulate API calls using our mock data
+// Remove trailing slash if present to avoid double slashes in URLs
+const normalizedBaseUrl = BASE_URL.endsWith('/') ? BASE_URL : `${BASE_URL}/`;
+
+// Define our invoice interface based on the API documentation
+export interface InvoiceModel {
+  id: number;
+  hash_code: string;
+  user_account_number: string;
+  invoice_number: string;
+  company_number: string;
+  customer_number: string;
+  invoice_amount: string; // API returns this as a string
+  payment_due_date: string;
+  payment_date: string | null;
+  customer_ach_enabled: number; // API returns this as 0 or 1
+  customer_cc_token: number; // API returns this as 0 or 1
+  payment_method: string | null;
+  cc_service_fee: string; // API returns this as a string
+  control_number: string | null;
+  status: string;
+  date_paid: string | null;
+  created_at: string;
+  updated_at: string;
+  // The API doesn't actually return a pin field
+  pin?: string;
+}
+
 export const api = createApi({
   reducerPath: 'api',
   baseQuery: fetchBaseQuery({ baseUrl: BASE_URL }),
   tagTypes: ['Invoice'],
   endpoints: (builder) => ({
-    // Get invoice by ID and verify PIN
-    getInvoice: builder.query<Invoice | null, { invoiceId: string; pin: string }>(
-      {
-        queryFn: ({ invoiceId, pin }) => {
-          // Simulate API delay
-          return new Promise((resolve) => {
-            setTimeout(() => {
-              const invoice = mockInvoices.find((inv) => inv.id === invoiceId);
-              
-              if (!invoice) {
-                resolve({ data: null });
-                return;
-              }
-              
-              if (invoice.pin !== pin) {
-                resolve({ error: { status: 401, data: 'Invalid PIN' } });
-                return;
-              }
-              
-              resolve({ data: invoice });
-            }, 500);
-          });
-        },
-        providesTags: (result) =>
-          result ? [{ type: 'Invoice', id: result.id }] : ['Invoice'],
-      }
-    ),
+    // Get invoice by ID or hash code
+    getInvoice: builder.query<InvoiceModel, { invoiceId: string; pin: string }>({
+      query: ({ invoiceId, pin }) => `${normalizedBaseUrl}api/invoices/${invoiceId}?pin=${pin}`,
+      providesTags: (result) =>
+        result ? [{ type: 'Invoice', id: result.invoice_number }] : ['Invoice'],
+    }),
     
-    // Process payment
-    processPayment: builder.mutation<
+    // Update invoice with PIN verification
+    updateInvoice: builder.mutation<InvoiceModel, { invoiceId: string; data: Partial<InvoiceModel> & { pin: string } }>({
+      query: ({ invoiceId, data }) => ({
+        url: `${normalizedBaseUrl}api/invoices/${invoiceId}`,
+        method: 'PUT',
+        body: data,
+      }),
+      invalidatesTags: (result) =>
+        result ? [{ type: 'Invoice', id: result.invoice_number }] : ['Invoice'],
+    }),
+    
+    // This is a helper mutation that combines getting the invoice and updating it
+    // It's used for scheduling payments
+    schedulePayment: builder.mutation<
       PaymentResponse,
       {
         invoiceId: string;
-        paymentOption: 'full' | 'partial' | 'dueDate';
-        paymentMethod: 'creditCard' | 'ach' | 'check';
-        paymentAmount?: number;
-        additionalMessage?: string;
+        pin: string;
+        paymentMethod: 'ACH' | 'Credit Card' | 'Check';
+        paymentDate: string;
       }
     >({
-      queryFn: ({
-        invoiceId,
-        paymentOption,
-        paymentMethod,
-        paymentAmount,
-        // Use additionalMessage in the actual implementation
-      }) => {
-        return new Promise((resolve) => {
-          setTimeout(() => {
-            const invoice = mockInvoices.find((inv) => inv.id === invoiceId);
-            
-            if (!invoice) {
-              resolve({ error: { status: 404, data: 'Invoice not found' } });
-              return;
+      async queryFn({ invoiceId, pin, paymentMethod, paymentDate }, _api, _extraOptions, fetchWithBQ) {
+        try {
+          // Update the invoice with payment details
+          const updateResult = await fetchWithBQ({
+            url: `${normalizedBaseUrl}api/invoices/${invoiceId}`,
+            method: 'PUT',
+            body: {
+              pin,
+              payment_method: paymentMethod,
+              payment_date: paymentDate,
+              status: 'Scheduled for payment'
             }
-            
-            const amount =
-              paymentOption === 'full'
-                ? invoice.outstandingBalance
-                : paymentOption === 'partial'
-                ? paymentAmount || 0
-                : invoice.outstandingBalance;
-            
-            const processingFee = paymentMethod === 'creditCard' ? amount * 0.029 : 0;
-            
-            const response: PaymentResponse = {
-              invoiceNumber: invoice.invoiceNumber,
-              customer: invoice.customer,
-              paymentOption: paymentOption === 'full' 
-                ? 'Full payment now'
-                : paymentOption === 'partial'
-                ? 'Partial payment now'
-                : 'Payment on due date',
-              paymentMethod: paymentMethod === 'creditCard'
-                ? 'Credit card on file'
-                : paymentMethod === 'ach'
-                ? 'ACH on file'
-                : 'Check',
-              paymentAmount: amount,
-              processingFee,
-              totalAmount: amount + processingFee,
-              transactionDate: new Date().toLocaleDateString(),
-              transactionId: `TRX-${Math.floor(Math.random() * 1000000)}`,
-              success: true,
-            };
-            
-            resolve({ data: response });
-          }, 1000);
-        });
+          });
+          
+          if (updateResult.error) {
+            return { error: updateResult.error };
+          }
+          
+          const invoice = updateResult.data as InvoiceModel;
+          
+          // Create a response object similar to the previous implementation
+          const processingFee = paymentMethod === 'Credit Card' ? parseFloat(invoice.cc_service_fee) : 0;
+          
+          const response: PaymentResponse = {
+            invoiceNumber: invoice.invoice_number,
+            customer: invoice.customer_number,
+            paymentOption: 'Payment on scheduled date',
+            paymentMethod: paymentMethod === 'Credit Card'
+              ? 'Credit card on file'
+              : paymentMethod === 'ACH'
+              ? 'ACH on file'
+              : 'Check',
+            paymentAmount: parseFloat(invoice.invoice_amount),
+            processingFee,
+            totalAmount: parseFloat(invoice.invoice_amount) + processingFee,
+            transactionDate: paymentDate,
+            transactionId: invoice.control_number,
+            success: true,
+          };
+          
+          return { data: response };
+        } catch (error) {
+          return { error: { status: 500, data: 'Failed to schedule payment' } };
+        }
       },
-      invalidatesTags: (result) =>
-        result ? [{ type: 'Invoice', id: result.invoiceNumber }] : ['Invoice'],
+      invalidatesTags: ['Invoice'],
     }),
   }),
 });
 
-export const { useGetInvoiceQuery, useProcessPaymentMutation } = api;
+export const { 
+  useGetInvoiceQuery, 
+  useUpdateInvoiceMutation,
+  useSchedulePaymentMutation 
+} = api;
